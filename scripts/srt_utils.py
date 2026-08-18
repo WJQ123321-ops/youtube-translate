@@ -8,6 +8,8 @@ agent directly when creating translated / bilingual SRT files.
 
 from __future__ import annotations
 
+import locale
+import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -41,16 +43,22 @@ _TS_RE = re.compile(
 
 
 def _seconds_to_ts(seconds: float) -> str:
-    """float seconds → 'HH:MM:SS,mmm'"""
+    """float seconds → 'HH:MM:SS,mmm'
+
+    Uses total milliseconds so cascading carries (ms→s→m→h) are always
+    correct, e.g. 59.9996 → 00:01:00,000 rather than 00:00:60,000.
+    """
+    if seconds is None or (isinstance(seconds, float) and (math.isnan(seconds) or math.isinf(seconds))):
+        seconds = 0.0
     if seconds < 0:
-        seconds = 0
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    if ms == 1000:          # rounding overflow
-        s += 1
-        ms = 0
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3600000
+    total_ms %= 3600000
+    m = total_ms // 60000
+    total_ms %= 60000
+    s = total_ms // 1000
+    ms = total_ms % 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -102,14 +110,25 @@ def parse_srt(content: str) -> List[Segment]:
 
         ts_line = lines[ts_line_idx].strip()
         m = re.match(
-            r'(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})',
+            r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})',
             ts_line,
         )
         if not m:
             continue
 
-        start = _ts_to_seconds(m.group(1))
-        end = _ts_to_seconds(m.group(2))
+        # Validate minute/second ranges
+        try:
+            sh, sm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            eh, em, es = int(m.group(5)), int(m.group(6)), int(m.group(7))
+        except ValueError:
+            continue
+        if not (0 <= sm < 60 and 0 <= ss < 60 and 0 <= em < 60 and 0 <= es < 60):
+            continue
+
+        start = _ts_to_seconds(f"{sh}:{sm}:{ss}.{m.group(4)}")
+        end = _ts_to_seconds(f"{eh}:{em}:{es}.{m.group(8)}")
+        if start > end:
+            continue
         text_lines = lines[ts_line_idx + 1:]
         text = '\n'.join(t.rstrip() for t in text_lines if t.strip())
 
@@ -127,19 +146,72 @@ def parse_srt(content: str) -> List[Segment]:
     return segments
 
 
+def _get_system_encoding() -> str | None:
+    """Best-effort detection of the system's legacy encoding.
+
+    On Windows, uses GetACP() (returns e.g. 936 for GBK, 1252 for Latin-1)
+    because locale.getpreferredencoding() may return 'utf-8' under Python's
+    UTF-8 mode. On other platforms, falls back to locale.
+    """
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            cp = ctypes.windll.kernel32.GetACP()
+            return f'cp{cp}'
+        except Exception:
+            pass
+    try:
+        enc = locale.getpreferredencoding(False)
+        return enc if enc else None
+    except Exception:
+        return None
+
+
 def parse_srt_file(path: str | Path) -> List[Segment]:
-    """Read an SRT file and parse it."""
+    """Read an SRT file and parse it.
+
+    Encoding detection strategy:
+      1. If the file has a UTF-16 BOM (FF FE / FE FF), decode as utf-16.
+      2. If the file has a UTF-8 BOM (EF BB BF), decode as utf-8-sig.
+      3. Otherwise try utf-8-sig (handles BOM-less UTF-8), then the
+         system default encoding (e.g. GBK on Chinese Windows).
+      4. UTF-16 without BOM is not auto-detected (ambiguous); add a BOM
+         or convert to UTF-8 if you have such a file.
+    """
     p = Path(path)
-    content = p.read_text(encoding='utf-8-sig')
+    raw = p.read_bytes()
+
+    if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
+        encodings = ['utf-16']
+    elif raw.startswith(b'\xef\xbb\xbf'):
+        encodings = ['utf-8-sig']
+    else:
+        encodings = ['utf-8-sig', 'utf-8']
+        sys_enc = _get_system_encoding()
+        if sys_enc and sys_enc.lower() not in ('utf-8', 'utf-8-sig'):
+            encodings.append(sys_enc)
+
+    content = None
+    for enc in encodings:
+        try:
+            content = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    if content is None:
+        content = raw.decode('utf-8', errors='replace')
+
     return parse_srt(content)
 
 
 # ── write ──────────────────────────────────────────────────────────
 
 def format_srt(segments: List[Segment]) -> str:
-    """Render segments to SRT text."""
+    """Render segments to SRT text. Segments are re-numbered sequentially."""
     parts: List[str] = []
-    for seg in segments:
+    for i, seg in enumerate(segments, 1):
+        seg.index = i
         block = f"{seg.index}\n"
         block += f"{seg.start_ts} --> {seg.end_ts}\n"
         if seg.secondary:
@@ -163,25 +235,35 @@ def write_srt(segments: List[Segment], path: str | Path) -> Path:
 def merge_bilingual(
     primary: List[Segment],
     secondary: List[Segment],
+    time_threshold: float = 2.0,
 ) -> List[Segment]:
     """Merge two SRT segment lists into a bilingual SRT.
 
     Uses primary segments' timestamps. Secondary text is attached to
-    the matching segment by index (or by closest timestamp if counts differ).
+    the matching segment by index (when counts match) or by closest
+    start time within time_threshold (when counts differ).
+
+    If secondary is empty, returns primary unchanged.
     """
+    if not secondary:
+        return primary
+
     if len(secondary) == len(primary):
         for p, s in zip(primary, secondary):
             p.secondary = s.text
         return primary
 
-    # fallback: match by closest start time
-    sec_starts = [s.start for s in secondary]
+    # fallback: match by closest start time within threshold
     for p in primary:
-        best_idx = min(
-            range(len(sec_starts)),
-            key=lambda i: abs(sec_starts[i] - p.start),
-        )
-        p.secondary = secondary[best_idx].text
+        best_idx = -1
+        best_diff = float('inf')
+        for i, s in enumerate(secondary):
+            diff = abs(s.start - p.start)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        if best_idx >= 0 and best_diff <= time_threshold:
+            p.secondary = secondary[best_idx].text
     return primary
 
 

@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 """Burn SRT subtitles into a video using ffmpeg.
 
+Supports three modes:
+  1. Single-language:  burn_subtitles.py video.mp4 zh.srt
+  2. Bilingual (one SRT, two lines per entry):
+                       burn_subtitles.py video.mp4 bilingual.srt --bilingual
+  3. Dual-layer (two separate SRTs, English on top / Chinese below):
+                       burn_subtitles.py video.mp4 --dual en.srt zh.srt
+
+Features:
+  - Auto-detects CJK fonts (Microsoft YaHei / PingFang SC / Noto Sans CJK)
+  - Auto-scales font size & margins to video resolution (via ffprobe)
+  - Semi-transparent box for readability without blocking too much video
+  - English line rendered slightly dimmer than Chinese in dual-layer mode
+
 Usage:
   python burn_subtitles.py <video.mp4> <subtitles.srt> [output.mp4] [options]
 
 Options:
-  --font-size N       subtitle font size (default: 24, bilingual: 18)
-  --font NAME         font name (default: Arial)
+  --font-size N       subtitle font size (auto-scaled if omitted)
+  --font NAME         font name (auto-detected for CJK if omitted)
   --position POS      bottom | top | center  (default: bottom)
-  --margin-v N        vertical margin in pixels (default: 30)
-  --bilingual         optimise styling for bilingual SRT (smaller font)
+  --margin-v N        vertical margin in pixels (auto-scaled if omitted)
+  --bilingual         optimise styling for bilingual SRT (two-line entries)
+  --dual EN ZH        dual-layer: burn English SRT on top, Chinese SRT below
+  --crf N             x264 CRF value (default: 23)
+  --preset P          x264 preset (default: medium)
 
 Produces output.mp4 with burned-in subtitles.
 If output path is omitted, writes <video_name>_subtitled.mp4.
@@ -18,40 +34,149 @@ If output path is omitted, writes <video_name>_subtitled.mp4.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+# Fix Windows console encoding so ✓/✗/⚠/→/— don't crash on GBK terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-def _check_ffmpeg() -> str:
-    p = shutil.which('ffmpeg')
+
+# ── tool detection ─────────────────────────────────────────────────
+
+def _check_tool(name: str) -> str:
+    p = shutil.which(name)
     if not p:
-        print("ERROR: ffmpeg not found in PATH.", file=sys.stderr)
-        print("  Download from https://ffmpeg.org/download.html", file=sys.stderr)
+        print(f"ERROR: {name} not found in PATH.", file=sys.stderr)
+        if name == 'ffmpeg':
+            print("  Download from https://ffmpeg.org/download.html", file=sys.stderr)
+        elif name == 'ffprobe':
+            print("  ffprobe usually comes with ffmpeg.", file=sys.stderr)
         sys.exit(1)
     return p
 
 
+# ── video resolution ───────────────────────────────────────────────
+
+def get_video_height(video_path: Path) -> int:
+    """Return video height in pixels using ffprobe.
+
+    Falls back to 1080 with a warning if ffprobe is missing or returns
+    invalid data.
+    """
+    ffprobe = shutil.which('ffprobe')
+    if not ffprobe:
+        print("  WARNING: ffprobe not found; assuming 1080p for font scaling.",
+              file=sys.stderr)
+        return 1080
+    try:
+        r = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=height', '-of', 'json',
+             str(video_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        data = json.loads(r.stdout)
+        height = int(data['streams'][0]['height'])
+        if height <= 0:
+            print(f"  WARNING: ffprobe returned invalid height ({height}); assuming 1080p.",
+                  file=sys.stderr)
+            return 1080
+        return height
+    except Exception as e:
+        print(f"  WARNING: ffprobe failed ({e}); assuming 1080p for font scaling.",
+              file=sys.stderr)
+        return 1080
+
+
+def scale_params(height: int, bilingual: bool, dual: bool) -> tuple[int, int]:
+    """Return (font_size, margin_v) scaled to video height.
+
+    Base design is 1080p. Values scale linearly, clamped to sane ranges.
+    """
+    if bilingual or dual:
+        # Two lines: smaller font, more bottom margin
+        base_font = 20
+        base_margin = 48
+    else:
+        base_font = 26
+        base_margin = 40
+
+    scale = height / 1080.0
+    font_size = max(12, int(round(base_font * scale)))
+    margin_v = max(20, int(round(base_margin * scale)))
+    return font_size, margin_v
+
+
+# ── font detection ─────────────────────────────────────────────────
+
+_CJK_FONT_CANDIDATES = [
+    # Windows
+    'Microsoft YaHei', 'Microsoft YaHei UI', 'SimHei', 'SimSun',
+    # macOS
+    'PingFang SC', 'Heiti SC', 'STHeiti',
+    # Linux
+    'Noto Sans CJK SC', 'Noto Sans SC', 'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
+]
+
+
+def detect_cjk_font() -> str | None:
+    """Try to find an installed CJK font using fc-list (Linux/macOS) or
+    Windows font directory check."""
+    # Linux / macOS: fc-list
+    fc_list = shutil.which('fc-list')
+    if fc_list:
+        try:
+            r = subprocess.run([fc_list, ':', 'family'],
+                               capture_output=True, text=True, timeout=10)
+            families = set()
+            for line in r.stdout.splitlines():
+                for fam in line.split(','):
+                    families.add(fam.strip())
+            for candidate in _CJK_FONT_CANDIDATES:
+                if candidate in families:
+                    return candidate
+        except Exception:
+            pass
+
+    # Windows: check Fonts directory for common CJK font files
+    if sys.platform == 'win32':
+        fonts_dir = Path(os.environ.get('WINDIR', r'C:\Windows')) / 'Fonts'
+        win_font_map = {
+            'msyh.ttc': 'Microsoft YaHei',
+            'msyhbd.ttc': 'Microsoft YaHei',
+            'msyhl.ttc': 'Microsoft YaHei UI',
+            'simhei.ttf': 'SimHei',
+            'simsun.ttc': 'SimSun',
+        }
+        for filename, font_name in win_font_map.items():
+            if (fonts_dir / filename).exists():
+                return font_name
+
+    return None
+
+
+# ── ffmpeg filter helpers ──────────────────────────────────────────
+
 def _escape_srt_path(path: str) -> str:
     """Escape a file path for ffmpeg's subtitles filter.
 
-    ffmpeg subtitle filter requires:
-    - Forward slashes (even on Windows)
-    - Escaped backslashes and colons
-    - The path wrapped in the filter argument
+    Converts Windows backslashes to forward slashes, then escapes the
+    characters that are special to ffmpeg's filtergraph parser:
+    : ' , ;
     """
-    # Convert to absolute path with forward slashes
     p = Path(path).resolve()
     s = str(p).replace('\\', '/')
-
-    # Escape characters that ffmpeg filter parser treats specially
-    # On Windows, drive letter colon needs escaping: C:/ → C\:/
-    # Also escape backslashes and single quotes
+    # Order matters: escape backslash-like and colon first, then quotes/commas/semicolons
     s = s.replace(':', '\\:')
     s = s.replace("'", "\\'")
+    s = s.replace(',', '\\,')
+    s = s.replace(';', '\\;')
     return s
 
 
@@ -60,80 +185,190 @@ def _build_style(
     font_name: str,
     position: str,
     margin_v: int,
-    bilingual: bool,
+    primary_colour: str = '&H00FFFFFF',   # white
+    back_colour: str = '&H80000000',      # semi-transparent black
+    outline: int = 1,
+    line_spacing: int = 0,
+    bold: int = 0,
 ) -> str:
     """Build the force_style string for ffmpeg's subtitles filter."""
-    alignment_map = {
-        'bottom': 2,    # bottom-center
-        'top': 8,       # top-center
-        'center': 5,    # middle-center
-    }
+    alignment_map = {'bottom': 2, 'top': 8, 'center': 5}
     alignment = alignment_map.get(position, 2)
 
     parts = [
         f"FontSize={font_size}",
         f"FontName={font_name}",
-        "PrimaryColour=&H00FFFFFF",      # white
-        "OutlineColour=&H00000000",      # black outline
-        "BackColour=&H80000000",         # semi-transparent black background
-        "BorderStyle=3",                  # opaque box (more readable)
-        "Outline=1",
+        f"PrimaryColour={primary_colour}",
+        "OutlineColour=&H00000000",
+        f"BackColour={back_colour}",
+        "BorderStyle=3",       # opaque box
+        f"Outline={outline}",
         "Shadow=0",
         f"Alignment={alignment}",
         f"MarginV={margin_v}",
-        "Bold=0",
+        f"Bold={bold}",
     ]
-
-    if bilingual:
-        # smaller font, tighter line spacing for bilingual
-        parts[0] = f"FontSize={font_size}"
-        parts.append("LineSpacing=-2")
+    if line_spacing:
+        parts.append(f"LineSpacing={line_spacing}")
 
     return ','.join(parts)
 
 
+def _build_single_filter(
+    srt_path: Path,
+    font_size: int,
+    font_name: str,
+    position: str,
+    margin_v: int,
+    bilingual: bool,
+) -> str:
+    """Build a single-layer subtitles filter."""
+    escaped = _escape_srt_path(str(srt_path))
+    line_spacing = -1 if bilingual else 0
+    style = _build_style(
+        font_size=font_size,
+        font_name=font_name,
+        position=position,
+        margin_v=margin_v,
+        line_spacing=line_spacing,
+    )
+    return f"subtitles='{escaped}':force_style='{style}'"
+
+
+def _build_dual_filter(
+    en_srt_path: Path,
+    zh_srt_path: Path,
+    font_size: int,
+    font_name: str,
+    margin_v: int,
+    position: str = 'bottom',
+) -> str:
+    """Build a dual-layer filter: English (smaller, dimmer) + Chinese (larger, white).
+
+    position controls where the pair sits:
+      - bottom: Chinese at bottom margin, English above it
+      - top:    Chinese at top margin, English below it
+      - center: falls back to bottom layout (ASS vertical centering does not
+                support per-line vertical offset predictably)
+    """
+    en_escaped = _escape_srt_path(str(en_srt_path))
+    zh_escaped = _escape_srt_path(str(zh_srt_path))
+    line_gap = int(font_size * 1.8)
+
+    if position == 'top':
+        zh_margin = margin_v
+        en_margin = margin_v + line_gap
+        align_position = 'top'
+    elif position == 'center':
+        # Center alignment (ASS Alignment=5) ignores MarginV for vertical
+        # positioning, so we cannot offset the two lines independently.
+        # Fall back to bottom layout for a predictable two-line stack.
+        zh_margin = margin_v
+        en_margin = margin_v + line_gap
+        align_position = 'bottom'
+    else:  # bottom
+        zh_margin = margin_v
+        en_margin = margin_v + line_gap
+        align_position = 'bottom'
+
+    # English line: smaller font, semi-transparent white
+    en_style = _build_style(
+        font_size=max(12, int(font_size * 0.75)),
+        font_name=font_name,
+        position=align_position,
+        margin_v=en_margin,
+        primary_colour='&HC0FFFFFF',   # 75% opaque white
+        back_colour='&H60000000',      # more transparent box
+        outline=1,
+    )
+
+    # Chinese line: full size, solid white
+    zh_style = _build_style(
+        font_size=font_size,
+        font_name=font_name,
+        position=align_position,
+        margin_v=zh_margin,
+        primary_colour='&H00FFFFFF',   # solid white
+        back_colour='&H80000000',
+        outline=2,
+    )
+
+    return (
+        f"subtitles='{en_escaped}':force_style='{en_style}',"
+        f"subtitles='{zh_escaped}':force_style='{zh_style}'"
+    )
+
+
+# ── main burn logic ────────────────────────────────────────────────
+
 def burn_subtitles(
     video_path: Path,
-    srt_path: Path,
+    srt_path: Path | None,
     output_path: Path,
-    font_size: int = 24,
-    font_name: str = 'Arial',
+    font_size: int | None = None,
+    font_name: str | None = None,
     position: str = 'bottom',
-    margin_v: int = 30,
+    margin_v: int | None = None,
     bilingual: bool = False,
+    dual_en: Path | None = None,
+    dual_zh: Path | None = None,
+    crf: int = 23,
+    preset: str = 'medium',
 ) -> Path:
     """Burn subtitles into video. Returns output path."""
-    ffmpeg = _check_ffmpeg()
+    ffmpeg = _check_tool('ffmpeg')
 
-    # Adjust font size for bilingual if not explicitly set
-    if bilingual and font_size == 24:
-        font_size = 18
+    # Auto-detect CJK font if not specified
+    if not font_name:
+        font_name = detect_cjk_font() or 'Arial'
+        print(f"  Font: {font_name} (auto-detected)", file=sys.stderr)
 
-    escaped_srt = _escape_srt_path(str(srt_path))
-    style = _build_style(font_size, font_name, position, margin_v, bilingual)
+    # Auto-scale font size & margin based on video resolution
+    height = get_video_height(video_path)
+    dual = dual_en is not None and dual_zh is not None
+    if font_size is None or margin_v is None:
+        auto_fs, auto_mv = scale_params(height, bilingual, dual)
+        if font_size is None:
+            font_size = auto_fs
+        if margin_v is None:
+            margin_v = auto_mv
+    print(f"  Video height: {height}px → font-size={font_size}, margin-v={margin_v}",
+          file=sys.stderr)
 
-    # Build the filter string
-    vf = f"subtitles='{escaped_srt}':force_style='{style}'"
+    # Build filter chain
+    if dual:
+        vf = _build_dual_filter(dual_en, dual_zh, font_size, font_name,
+                                margin_v, position)
+        srt_label = f"{dual_en.name} + {dual_zh.name}"
+    else:
+        if srt_path is None:
+            print("ERROR: No subtitle file provided.", file=sys.stderr)
+            sys.exit(1)
+        vf = _build_single_filter(srt_path, font_size, font_name,
+                                  position, margin_v, bilingual)
+        srt_label = srt_path.name
 
     cmd = [
         ffmpeg, '-y',
         '-i', str(video_path),
         '-vf', vf,
         '-c:v', 'libx264',
-        '-crf', '23',
-        '-preset', 'medium',
+        '-crf', str(crf),
+        '-preset', preset,
         '-c:a', 'copy',
         '-movflags', '+faststart',
         str(output_path),
     ]
 
-    print(f"Burning subtitles into video...", file=sys.stderr)
+    print(f"\nBurning subtitles into video...", file=sys.stderr)
     print(f"  Video:   {video_path.name}", file=sys.stderr)
-    print(f"  SRT:     {srt_path.name}", file=sys.stderr)
+    print(f"  SRT:     {srt_label}", file=sys.stderr)
     print(f"  Output:  {output_path.name}", file=sys.stderr)
-    print(f"  Style:   {style}", file=sys.stderr)
+    if dual:
+        print(f"  Mode:    dual-layer (EN top / ZH bottom)", file=sys.stderr)
+    elif bilingual:
+        print(f"  Mode:    bilingual (two-line)", file=sys.stderr)
 
-    # Run without capture_output so user sees progress
     r = subprocess.run(cmd, text=True)
 
     if r.returncode != 0:
@@ -150,37 +385,64 @@ def main():
         description='Burn SRT subtitles into a video using ffmpeg',
     )
     ap.add_argument('video', help='Input video file')
-    ap.add_argument('srt', help='SRT subtitle file')
+    ap.add_argument('srt', nargs='?', default=None,
+                    help='SRT subtitle file (not needed with --dual)')
     ap.add_argument('output', nargs='?', default=None,
                     help='Output video path (default: <name>_subtitled.mp4)')
-    ap.add_argument('--font-size', type=int, default=24,
-                    help='Subtitle font size (default: 24)')
-    ap.add_argument('--font', default='Arial',
-                    help='Font name (default: Arial)')
+    ap.add_argument('--font-size', type=int, default=None,
+                    help='Subtitle font size (auto-scaled to resolution if omitted)')
+    ap.add_argument('--font', default=None,
+                    help='Font name (auto-detects CJK font if omitted)')
     ap.add_argument('--position', default='bottom',
                     choices=['bottom', 'top', 'center'],
                     help='Subtitle position (default: bottom)')
-    ap.add_argument('--margin-v', type=int, default=30,
-                    help='Vertical margin in pixels (default: 30)')
+    ap.add_argument('--margin-v', type=int, default=None,
+                    help='Vertical margin in pixels (auto-scaled if omitted)')
     ap.add_argument('--bilingual', action='store_true',
-                    help='Optimise styling for bilingual SRT')
+                    help='Optimise styling for bilingual SRT (two-line entries)')
+    ap.add_argument('--dual', nargs=2, metavar=('EN_SRT', 'ZH_SRT'),
+                    default=None,
+                    help='Dual-layer mode: English SRT on top, Chinese SRT below')
+    ap.add_argument('--crf', type=int, default=23,
+                    help='x264 CRF value (default: 23)')
+    ap.add_argument('--preset', default='medium',
+                    help='x264 preset (default: medium)')
     args = ap.parse_args()
 
     video_path = Path(args.video).resolve()
-    srt_path = Path(args.srt).resolve()
-
     if not video_path.exists():
         print(f"ERROR: Video not found: {video_path}", file=sys.stderr)
         sys.exit(1)
-    if not srt_path.exists():
-        print(f"ERROR: SRT not found: {srt_path}", file=sys.stderr)
-        sys.exit(1)
+
+    srt_path = None
+    dual_en = dual_zh = None
+
+    if args.dual:
+        dual_en = Path(args.dual[0]).resolve()
+        dual_zh = Path(args.dual[1]).resolve()
+        for p, label in [(dual_en, 'English SRT'), (dual_zh, 'Chinese SRT')]:
+            if not p.exists():
+                print(f"ERROR: {label} not found: {p}", file=sys.stderr)
+                sys.exit(1)
+    else:
+        if not args.srt:
+            print("ERROR: Provide an SRT file, or use --dual EN ZH.", file=sys.stderr)
+            sys.exit(1)
+        srt_path = Path(args.srt).resolve()
+        if not srt_path.exists():
+            print(f"ERROR: SRT not found: {srt_path}", file=sys.stderr)
+            sys.exit(1)
 
     if args.output:
         output_path = Path(args.output).resolve()
     else:
         stem = video_path.stem
-        suffix = '_bilingual' if args.bilingual else '_subtitled'
+        if args.dual:
+            suffix = '_dual'
+        elif args.bilingual:
+            suffix = '_bilingual'
+        else:
+            suffix = '_subtitled'
         output_path = video_path.parent / f"{stem}{suffix}.mp4"
 
     burn_subtitles(
@@ -192,6 +454,10 @@ def main():
         position=args.position,
         margin_v=args.margin_v,
         bilingual=args.bilingual,
+        dual_en=dual_en,
+        dual_zh=dual_zh,
+        crf=args.crf,
+        preset=args.preset,
     )
 
 

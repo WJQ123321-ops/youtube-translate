@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import shutil
 import subprocess
@@ -108,21 +109,25 @@ def detect_windows_proxy() -> str | None:
 
 
 def check_yt_dlp_nightly() -> tuple[bool, str]:
-    """Check if yt-dlp is a recent enough version (2026.08+ recommended)."""
+    """Check yt-dlp release recency: warn only when older than ~3 months.
+
+    Version strings look like 2026.08.17.073947 (nightly) or 2026.07.04
+    (stable). The cutoff is relative to today's date so this check does not
+    go stale as time passes.
+    """
     if not check_cli('yt-dlp'):
         return False, ''
     ver = get_version('yt-dlp')
-    # Nightly versions look like 2026.08.17.073947
-    # Stable versions look like 2026.07.04
-    # We recommend 2026.08+ for PO Token support
     try:
-        date_part = ver.split('.')
-        year = int(date_part[0])
-        month = int(date_part[1]) if len(date_part) > 1 else 0
-        is_recent = (year > 2026) or (year == 2026 and month >= 8)
-        return is_recent, ver
-    except Exception:
+        year = int(ver.split('.')[0])
+        month = int(ver.split('.')[1]) if len(ver.split('.')) > 1 else 0
+    except (ValueError, IndexError):
         return True, ver  # can't parse, assume OK
+    now = datetime.date.today()
+    cutoff_year, cutoff_month = now.year, now.month - 3
+    if cutoff_month <= 0:
+        cutoff_year, cutoff_month = cutoff_year - 1, cutoff_month + 12
+    return (year, month) >= (cutoff_year, cutoff_month), ver
 
 
 def main():
@@ -219,8 +224,8 @@ def main():
         print(f"  ✓ OK          yt-dlp version      {ytdlp_ver} (recent)")
     else:
         print(f"  ⚠ OUTDATED    yt-dlp version      {ytdlp_ver}")
-        print(f"    → YouTube now requires PO Token; yt-dlp nightly (2026.08+) recommended.")
-        print(f"       Download: https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest")
+        print(f"    → YouTube's anti-bot changes break old yt-dlp versions.")
+        print(f"       Update it (nightly recommended): https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest")
         all_ok = False
 
     # --- Proxy detection ---

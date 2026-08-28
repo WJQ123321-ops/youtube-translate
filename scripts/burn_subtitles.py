@@ -26,6 +26,8 @@ Options:
   --dual EN ZH        dual-layer: burn English SRT on top, Chinese SRT below
   --crf N             x264 CRF value (default: 23)
   --preset P          x264 preset (default: medium)
+  --encoder NAME      auto | libx264 | nvenc  (default: auto — h264_nvenc
+                      when an NVIDIA GPU is available, else libx264)
 
 Produces output.mp4 with burned-in subtitles.
 If output path is omitted, writes <video_name>_subtitled.mp4.
@@ -59,6 +61,25 @@ def _check_tool(name: str) -> str:
             print("  ffprobe usually comes with ffmpeg.", file=sys.stderr)
         sys.exit(1)
     return p
+
+
+def _nvenc_available(ffmpeg: str) -> bool:
+    """Probe whether this ffmpeg build can encode h264_nvenc (NVIDIA GPU).
+
+    Encodes a single 256x256 null frame to /dev/null — fast and side-effect
+    free. Fails cleanly when no NVIDIA GPU/driver is present. (256x256, not
+    smaller: NVENC rejects frame dimensions below its ~145x49 minimum.)
+    """
+    try:
+        r = subprocess.run(
+            [ffmpeg, '-hide_banner', '-v', 'error', '-f', 'lavfi',
+             '-i', 'nullsrc=s=256x256:d=0.2', '-frames:v', '1',
+             '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 # ── video resolution ───────────────────────────────────────────────
@@ -271,9 +292,10 @@ def _build_dual_filter(
         en_margin = margin_v + line_gap
         align_position = 'bottom'
 
-    # English line: smaller font, semi-transparent white
+    # English line: smaller font, semi-transparent white.
+    # Floor is 9 (not 12) so the 75% size ratio survives the low-res clamp.
     en_style = _build_style(
-        font_size=max(12, int(font_size * 0.75)),
+        font_size=max(9, int(font_size * 0.75)),
         font_name=font_name,
         position=align_position,
         margin_v=en_margin,
@@ -299,6 +321,36 @@ def _build_dual_filter(
     )
 
 
+# ── encoder selection ──────────────────────────────────────────────
+
+# x264 preset → NVENC p-preset (p1 fastest / p7 best quality)
+_NVENC_PRESET_MAP = {
+    'ultrafast': 'p1', 'superfast': 'p2', 'veryfast': 'p3', 'faster': 'p3',
+    'fast': 'p4', 'medium': 'p5', 'slow': 'p6', 'slower': 'p7', 'slowest': 'p7',
+}
+
+
+def _select_encoder(ffmpeg: str, encoder: str) -> tuple[str, str]:
+    """Resolve requested encoder to (ffmpeg codec, human-readable label).
+
+    'auto' probes h264_nvenc once and falls back to libx264. Forcing nvenc
+    when the probe fails is a hard error (exit 1) so the user knows why.
+    """
+    want = (encoder or 'auto').strip().lower()
+    if want in ('cpu', 'libx264', 'x264'):
+        return 'libx264', 'libx264 (CPU)'
+    if want in ('nvenc', 'h264_nvenc', 'gpu'):
+        if not _nvenc_available(ffmpeg):
+            print("ERROR: --encoder nvenc requested, but h264_nvenc is not "
+                  "available (no NVIDIA GPU/driver, or an ffmpeg build "
+                  "without NVENC support).", file=sys.stderr)
+            sys.exit(1)
+        return 'h264_nvenc', 'h264_nvenc (NVIDIA GPU)'
+    if _nvenc_available(ffmpeg):
+        return 'h264_nvenc', 'h264_nvenc (NVIDIA GPU, auto-detected)'
+    return 'libx264', 'libx264 (CPU, NVENC unavailable)'
+
+
 # ── main burn logic ────────────────────────────────────────────────
 
 def burn_subtitles(
@@ -314,6 +366,7 @@ def burn_subtitles(
     dual_zh: Path | None = None,
     crf: int = 23,
     preset: str = 'medium',
+    encoder: str = 'auto',
 ) -> Path:
     """Burn subtitles into video. Returns output path."""
     ffmpeg = _check_tool('ffmpeg')
@@ -348,17 +401,19 @@ def burn_subtitles(
                                   position, margin_v, bilingual)
         srt_label = srt_path.name
 
-    cmd = [
-        ffmpeg, '-y',
-        '-i', str(video_path),
-        '-vf', vf,
-        '-c:v', 'libx264',
-        '-crf', str(crf),
-        '-preset', preset,
-        '-c:a', 'copy',
-        '-movflags', '+faststart',
-        str(output_path),
-    ]
+    codec, enc_label = _select_encoder(ffmpeg, encoder)
+    print(f"  Encoder: {enc_label}", file=sys.stderr)
+
+    cmd = [ffmpeg, '-y', '-i', str(video_path), '-vf', vf]
+    if codec == 'h264_nvenc':
+        # NVENC has no CRF; -rc vbr + -cq + -b:v 0 is its constant-quality
+        # equivalent. x264 preset names map onto NVENC p1-p7.
+        nv_preset = _NVENC_PRESET_MAP.get(preset.lower(), 'p5')
+        cmd += ['-c:v', codec, '-preset', nv_preset,
+                '-rc', 'vbr', '-cq', str(crf), '-b:v', '0']
+    else:
+        cmd += ['-c:v', codec, '-crf', str(crf), '-preset', preset]
+    cmd += ['-c:a', 'copy', '-movflags', '+faststart', str(output_path)]
 
     print(f"\nBurning subtitles into video...", file=sys.stderr)
     print(f"  Video:   {video_path.name}", file=sys.stderr)
@@ -404,9 +459,13 @@ def main():
                     default=None,
                     help='Dual-layer mode: English SRT on top, Chinese SRT below')
     ap.add_argument('--crf', type=int, default=23,
-                    help='x264 CRF value (default: 23)')
+                    help='x264 CRF / NVENC CQ value (default: 23)')
     ap.add_argument('--preset', default='medium',
                     help='x264 preset (default: medium)')
+    ap.add_argument('--encoder', default='auto',
+                    choices=['auto', 'libx264', 'nvenc'],
+                    help='Video encoder: auto uses NVIDIA NVENC when '
+                         'available, else libx264 (default: auto)')
     args = ap.parse_args()
 
     video_path = Path(args.video).resolve()
@@ -458,6 +517,7 @@ def main():
         dual_zh=dual_zh,
         crf=args.crf,
         preset=args.preset,
+        encoder=args.encoder,
     )
 
 

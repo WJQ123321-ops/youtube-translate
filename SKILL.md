@@ -4,8 +4,9 @@ description: "YouTube 视频翻译流水线 — 粘贴 YouTube 链接，自动�
 display_name: YouTube 视频翻译
 display_name_en: YouTube Video Translate
 category: media
-version: 1.3.0
-author: agent_created
+version: 1.4.0
+author: WJQ123321-ops
+contributors: ZCode (GLM)
 agent_created: true
 ---
 
@@ -106,10 +107,12 @@ python "$SKILL_PATH/scripts/download_and_transcribe.py" "<youtube_url>" ./output
   "files": {
     "video": "./output/video.mp4",
     "audio": "./output/audio.wav",
-    "srt_en": "./output/en.srt"
+    "srt_source": "./output/en.srt"
   }
 }
 ```
+
+> SRT 以源语言命名（`--language en` → `en.srt`；`--language auto` → 检测到的语言代码，如 `ja.srt`）。
 
 ### Step 4：AI 翻译（Agent 执行）
 
@@ -171,6 +174,11 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/zh.sr
 - **半透明黑底**：BorderStyle=3 保证字幕在任何画面上都可读
 - **路径转义**：自动处理 Windows 路径中的反斜杠、冒号、单引号、逗号、分号等特殊字符
 
+**编码加速：**
+- 默认 `--encoder auto`：自动探测 NVIDIA NVENC（h264_nvenc），可用时用 GPU 编码（长视频烧录比 CPU libx264 快数倍），不可用自动回退 libx264
+- `--crf` 在 NVENC 下映射为等价的 `-cq` 恒定质量模式，`--preset` 映射为 NVENC p1-p7
+- 可用 `--encoder libx264` 强制 CPU 编码
+
 **可选参数：**
 
 | 参数 | 默认值 | 说明 |
@@ -181,8 +189,9 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/zh.sr
 | `--font` | 自动检测 | 字体名称（省略时自动检测中文字体，失败回退 Arial） |
 | `--position` | bottom | bottom / top / center（dual 模式下 center 回退为 bottom 布局） |
 | `--margin-v` | 自动缩放 | 垂直边距（像素，省略时自动计算） |
-| `--crf` | 23 | x264 质量参数（越小质量越高） |
-| `--preset` | medium | x264 编码预设 |
+| `--crf` | 23 | x264 CRF / NVENC CQ 质量参数（越小质量越高） |
+| `--preset` | medium | x264 编码预设（NVENC 下映射为 p1-p7） |
+| `--encoder` | auto | auto / libx264 / nvenc。auto 自动探测 NVENC，失败回退 libx264 |
 
 输出文件：`video_dual.mp4`（双层）、`video_bilingual.mp4`（双语）或 `video_subtitled.mp4`（单语）
 
@@ -194,10 +203,10 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/zh.sr
 output/
 ├── video.mp4              # 原始下载视频
 ├── audio.wav              # 提取的音频
-├── en.srt                 # 英文字幕
+├── <lang>.srt             # 源语言字幕（英语视频即 en.srt）
 ├── zh.srt                 # 中文字幕（Agent 翻译）
 ├── bilingual.srt          # 双语字幕
-└── video_subtitled.mp4    # 最终视频（带字幕）
+└── video_dual.mp4         # 最终视频（双层字幕，或 *_bilingual / *_subtitled）
 ```
 
 ## 脚本说明

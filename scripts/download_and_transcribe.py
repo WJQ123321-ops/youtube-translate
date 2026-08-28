@@ -27,7 +27,8 @@ Options:
 Output files (in output_dir):
   video.mp4     — downloaded video
   audio.wav     — extracted audio
-  en.srt        — English (source language) subtitles
+  <lang>.srt    — source-language subtitles, named by the source language
+                  (en.srt for --language en, the detected code for auto)
   metadata.json — { url, title, duration, language, model, files }
 
 The script prints a JSON summary at the end so the agent can parse it.
@@ -52,6 +53,45 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ── proxy & environment helpers ────────────────────────────────────
 
+def _normalise_proxy_server(server: str) -> str | None:
+    """Normalise a WinINET ProxyServer value into a proxy URL.
+
+    Handles both registry forms:
+      "host:port"                            → http://host:port
+      "http=h:p;https=h:p;socks=host:port"   → first of https / http / socks
+
+    SOCKS addresses get a socks5:// scheme (WinINET only says "socks", which
+    in practice is SOCKS5 for tools like Clash) so yt-dlp and requests can
+    actually use them.
+    """
+    server = server.strip()
+    if not server:
+        return None
+
+    is_socks = False
+    if '=' in server:
+        addr_by_proto: dict[str, str] = {}
+        for part in server.split(';'):
+            if '=' in part:
+                proto, addr = part.split('=', 1)
+                addr_by_proto[proto.strip().lower()] = addr.strip()
+        addr = (addr_by_proto.get('https') or addr_by_proto.get('http')
+                or addr_by_proto.get('socks'))
+        if not addr:
+            return None
+        is_socks = not (addr_by_proto.get('https') or addr_by_proto.get('http'))
+    else:
+        addr = server
+        if addr.lower().startswith(('socks5://', 'socks4://', 'socks://')):
+            if addr.lower().startswith('socks://'):
+                addr = 'socks5://' + addr[len('socks://'):]
+            return addr
+
+    if addr.lower().startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+        return addr
+    return ('socks5://' if is_socks else 'http://') + addr
+
+
 def detect_system_proxy() -> str | None:
     """Detect system proxy (Windows registry, then env vars)."""
     # 1. Windows registry
@@ -66,15 +106,7 @@ def detect_system_proxy() -> str | None:
             if enable:
                 server, _ = winreg.QueryValueEx(key, 'ProxyServer')
                 winreg.CloseKey(key)
-                # Normalise: registry value may be "http=host:port;https=host:port" or just "host:port"
-                if '=' in server:
-                    for part in server.split(';'):
-                        if part.startswith('https=') or part.startswith('http='):
-                            server = part.split('=', 1)[1]
-                            break
-                if not server.startswith('http'):
-                    server = f'http://{server}'
-                return server
+                return _normalise_proxy_server(server)
             winreg.CloseKey(key)
         except Exception:
             pass
@@ -219,6 +251,8 @@ def download_video(
         '--socket-timeout', '30',
         '--print', '%(title)s',
         '--print', '%(duration)s',
+        # --print implies --simulate (download is skipped); force real download
+        '--no-simulate',
     ]
     if proxy:
         cmd += ['--proxy', proxy]
@@ -291,6 +325,19 @@ def _is_cuda_init_error(exc: Exception) -> bool:
     return any(kw in msg for kw in keywords)
 
 
+def _warmup_cuda(model) -> None:
+    """Force CUDA runtime libraries to load by transcribing 1s of silence.
+
+    CTranslate2 loads CUDA libs lazily — a model constructed with
+    device='cuda' succeeds even when e.g. cublas64_12.dll is missing, and
+    only fails later inside the real transcribe() call. Running this
+    warmup inside the try block makes such errors surface early so the
+    CPU fallback can actually trigger.
+    """
+    import numpy as np
+    model.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
+
+
 def transcribe(
     audio_path: Path,
     out_dir: Path,
@@ -298,11 +345,9 @@ def transcribe(
     language: str = 'en',
     device: str = 'auto',
 ) -> tuple[Path, str]:
-    """Transcribe audio with faster-whisper, output SRT."""
+    """Transcribe audio with faster-whisper, output SRT named <lang>.srt."""
     _check_python_pkg('faster_whisper', 'faster-whisper')
     from faster_whisper import WhisperModel
-
-    srt_path = out_dir / 'en.srt'
 
     print(f"\n[3/3] Transcribing (model={model_size}, lang={language}, device={device})...", file=sys.stderr)
     print(f"  (first run downloads the model — this may take a moment)", file=sys.stderr)
@@ -312,6 +357,7 @@ def transcribe(
         try:
             compute_type = 'default'
             model = WhisperModel(model_size, device='cuda', compute_type=compute_type)
+            _warmup_cuda(model)
             device = 'cuda'
             print(f"  Using CUDA GPU", file=sys.stderr)
         except Exception as e:
@@ -341,6 +387,12 @@ def transcribe(
 
     print(f"  Detected language: {info.language} (prob: {info.language_probability:.2f})", file=sys.stderr)
     print(f"  Duration: {info.duration:.1f}s", file=sys.stderr)
+
+    # Name the SRT after the actual source language — requested code, or the
+    # detected one for --language auto — so a Japanese transcription isn't
+    # misleadingly called en.srt. (--language en keeps the common en.srt.)
+    lang_code = language if language != 'auto' else (info.language or 'unknown')
+    srt_path = out_dir / f'{lang_code}.srt'
 
     # Build SRT
     import srt_utils
@@ -435,7 +487,7 @@ def main():
         'files': {
             'video': str(video_path),
             'audio': str(audio_path),
-            'srt_en': str(srt_path),
+            'srt_source': str(srt_path),
         },
         'output_dir': str(out_dir),
     }

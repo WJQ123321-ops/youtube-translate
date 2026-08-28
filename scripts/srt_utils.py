@@ -37,11 +37,6 @@ class Segment:
 
 # ── timestamp helpers ──────────────────────────────────────────────
 
-_TS_RE = re.compile(
-    r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})'
-)
-
-
 def _seconds_to_ts(seconds: float) -> str:
     """float seconds → 'HH:MM:SS,mmm'
 
@@ -110,7 +105,7 @@ def parse_srt(content: str) -> List[Segment]:
 
         ts_line = lines[ts_line_idx].strip()
         m = re.match(
-            r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})',
+            r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})',
             ts_line,
         )
         if not m:
@@ -125,8 +120,9 @@ def parse_srt(content: str) -> List[Segment]:
         if not (0 <= sm < 60 and 0 <= ss < 60 and 0 <= em < 60 and 0 <= es < 60):
             continue
 
-        start = _ts_to_seconds(f"{sh}:{sm}:{ss}.{m.group(4)}")
-        end = _ts_to_seconds(f"{eh}:{em}:{es}.{m.group(8)}")
+        # zfill: SRT ms field is an integer count of milliseconds, so ",5" → 5ms
+        start = _ts_to_seconds(f"{sh}:{sm}:{ss}.{m.group(4).zfill(3)}")
+        end = _ts_to_seconds(f"{eh}:{em}:{es}.{m.group(8).zfill(3)}")
         if start > end:
             continue
         text_lines = lines[ts_line_idx + 1:]
@@ -253,17 +249,22 @@ def merge_bilingual(
             p.secondary = s.text
         return primary
 
-    # fallback: match by closest start time within threshold
+    # fallback: match by closest start time within threshold.
+    # Track matched secondaries so one entry is never reused by two primaries.
+    used: set = set()
     for p in primary:
         best_idx = -1
         best_diff = float('inf')
         for i, s in enumerate(secondary):
+            if i in used:
+                continue
             diff = abs(s.start - p.start)
             if diff < best_diff:
                 best_diff = diff
                 best_idx = i
         if best_idx >= 0 and best_diff <= time_threshold:
             p.secondary = secondary[best_idx].text
+            used.add(best_idx)
     return primary
 
 

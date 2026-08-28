@@ -11,8 +11,8 @@ Supports three modes:
 Features:
   - Auto-detects CJK fonts (Microsoft YaHei / PingFang SC / Noto Sans CJK)
   - Auto-scales font size & margins to video resolution (via ffprobe)
-  - Semi-transparent box for readability without blocking too much video
-  - English line rendered slightly dimmer than Chinese in dual-layer mode
+  - Clean outline+shadow look by default (--style box for opaque boxes)
+  - Dual-layer: English ~72% size in light grey above the white Chinese line
 
 Usage:
   python burn_subtitles.py <video.mp4> <subtitles.srt> [output.mp4] [options]
@@ -119,13 +119,15 @@ def scale_params(height: int, bilingual: bool, dual: bool) -> tuple[int, int]:
     """Return (font_size, margin_v) scaled to video height.
 
     Base design is 1080p. Values scale linearly, clamped to sane ranges.
+    Outline style reads lighter than boxes, so the dual-layer fonts are a
+    touch smaller than the old boxed defaults.
     """
     if bilingual or dual:
-        # Two lines: smaller font, more bottom margin
-        base_font = 20
-        base_margin = 48
+        # Two lines: smaller font, a bit of bottom margin
+        base_font = 18
+        base_margin = 44
     else:
-        base_font = 26
+        base_font = 24
         base_margin = 40
 
     scale = height / 1080.0
@@ -207,8 +209,11 @@ def _build_style(
     position: str,
     margin_v: int,
     primary_colour: str = '&H00FFFFFF',   # white
-    back_colour: str = '&H80000000',      # semi-transparent black
-    outline: int = 1,
+    outline_colour: str = '&H00000000',   # black outline
+    back_colour: str = '&H80000000',      # semi-transparent shadow/box
+    outline: int = 3,
+    shadow: int = 1,
+    border_style: int = 1,                # 1=outline+shadow, 3=opaque box
     line_spacing: int = 0,
     bold: int = 0,
 ) -> str:
@@ -220,11 +225,11 @@ def _build_style(
         f"FontSize={font_size}",
         f"FontName={font_name}",
         f"PrimaryColour={primary_colour}",
-        "OutlineColour=&H00000000",
+        f"OutlineColour={outline_colour}",
         f"BackColour={back_colour}",
-        "BorderStyle=3",       # opaque box
+        f"BorderStyle={border_style}",
         f"Outline={outline}",
-        "Shadow=0",
+        f"Shadow={shadow}",
         f"Alignment={alignment}",
         f"MarginV={margin_v}",
         f"Bold={bold}",
@@ -242,6 +247,7 @@ def _build_single_filter(
     position: str,
     margin_v: int,
     bilingual: bool,
+    border_style: int = 1,
 ) -> str:
     """Build a single-layer subtitles filter."""
     escaped = _escape_srt_path(str(srt_path))
@@ -251,6 +257,9 @@ def _build_single_filter(
         font_name=font_name,
         position=position,
         margin_v=margin_v,
+        outline=3,
+        shadow=1,
+        border_style=border_style,
         line_spacing=line_spacing,
     )
     return f"subtitles='{escaped}':force_style='{style}'"
@@ -263,8 +272,14 @@ def _build_dual_filter(
     font_name: str,
     margin_v: int,
     position: str = 'bottom',
+    border_style: int = 1,
 ) -> str:
-    """Build a dual-layer filter: English (smaller, dimmer) + Chinese (larger, white).
+    """Build a dual-layer filter: English (smaller, lighter) + Chinese (larger, white).
+
+    Default look (border_style=1) is classic fansub style: white text with a
+    black outline and a soft shadow, no opaque boxes — much lighter on the
+    eyes than boxed text. border_style=3 restores the old semi-transparent
+    box look.
 
     position controls where the pair sits:
       - bottom: Chinese at bottom margin, English above it
@@ -292,27 +307,30 @@ def _build_dual_filter(
         en_margin = margin_v + line_gap
         align_position = 'bottom'
 
-    # English line: smaller font, semi-transparent white.
-    # Floor is 9 (not 12) so the 75% size ratio survives the low-res clamp.
+    # English line: ~72% size, soft light grey, thin outline
     en_style = _build_style(
-        font_size=max(9, int(font_size * 0.75)),
+        font_size=max(9, int(font_size * 0.72)),
         font_name=font_name,
         position=align_position,
         margin_v=en_margin,
-        primary_colour='&HC0FFFFFF',   # 75% opaque white
-        back_colour='&H60000000',      # more transparent box
-        outline=1,
+        primary_colour='&H00E8E8E8',
+        outline=2,
+        shadow=1,
+        border_style=border_style,
+        back_colour='&H90000000',
     )
 
-    # Chinese line: full size, solid white
+    # Chinese line: full size, solid white, stronger outline
     zh_style = _build_style(
         font_size=font_size,
         font_name=font_name,
         position=align_position,
         margin_v=zh_margin,
-        primary_colour='&H00FFFFFF',   # solid white
+        primary_colour='&H00FFFFFF',
+        outline=3,
+        shadow=1,
+        border_style=border_style,
         back_colour='&H80000000',
-        outline=2,
     )
 
     return (
@@ -367,6 +385,7 @@ def burn_subtitles(
     crf: int = 23,
     preset: str = 'medium',
     encoder: str = 'auto',
+    style: str = 'outline',
 ) -> Path:
     """Burn subtitles into video. Returns output path."""
     ffmpeg = _check_tool('ffmpeg')
@@ -389,16 +408,17 @@ def burn_subtitles(
           file=sys.stderr)
 
     # Build filter chain
+    border_style = 3 if style == 'box' else 1
     if dual:
         vf = _build_dual_filter(dual_en, dual_zh, font_size, font_name,
-                                margin_v, position)
+                                margin_v, position, border_style)
         srt_label = f"{dual_en.name} + {dual_zh.name}"
     else:
         if srt_path is None:
             print("ERROR: No subtitle file provided.", file=sys.stderr)
             sys.exit(1)
         vf = _build_single_filter(srt_path, font_size, font_name,
-                                  position, margin_v, bilingual)
+                                  position, margin_v, bilingual, border_style)
         srt_label = srt_path.name
 
     codec, enc_label = _select_encoder(ffmpeg, encoder)
@@ -466,6 +486,10 @@ def main():
                     choices=['auto', 'libx264', 'nvenc'],
                     help='Video encoder: auto uses NVIDIA NVENC when '
                          'available, else libx264 (default: auto)')
+    ap.add_argument('--style', default='outline', choices=['outline', 'box'],
+                    help="Subtitle look: outline (white text with black "
+                         "outline + soft shadow, default) or box "
+                         "(semi-transparent boxes, old style)")
     args = ap.parse_args()
 
     video_path = Path(args.video).resolve()
@@ -518,6 +542,7 @@ def main():
         crf=args.crf,
         preset=args.preset,
         encoder=args.encoder,
+        style=args.style,
     )
 
 

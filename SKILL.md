@@ -4,7 +4,7 @@ description: "YouTube 视频翻译流水线 — 粘贴 YouTube 链接，自动�
 display_name: YouTube 视频翻译
 display_name_en: YouTube Video Translate
 category: media
-version: 1.4.0
+version: 1.4.1
 author: WJQ123321-ops
 contributors: ZCode (GLM)
 agent_created: true
@@ -169,9 +169,9 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" "D:/youtube/<video_id>/video.mp4"
 
 **字幕样式特性：**
 - **中文字体自动检测**：Windows 自动使用微软雅黑（Microsoft YaHei），macOS 使用苹方（PingFang SC），Linux 使用 Noto Sans CJK，无需手动指定 `--font`；检测失败时回退到 Arial
-- **分辨率自适应**：通过 ffprobe 检测视频高度，字体大小和边距按 1080p 基准等比缩放（1080p 双语：font-size=20, margin-v=48）；ffprobe 缺失或异常时打印 warning 并回退 1080p
-- **双层模式**：英文行 75% 字号、半透明白色；中文行 100% 字号、纯白。支持 `--position top/bottom` 控制整体位置（`center` 回退为 bottom 布局以保证两行不重叠）
-- **半透明黑底**：BorderStyle=3 保证字幕在任何画面上都可读
+- **分辨率自适应**：通过 ffprobe 检测视频高度，字体大小和边距按 1080p 基准等比缩放（1080p 双语：font-size=18, margin-v=44）；ffprobe 缺失或异常时打印 warning 并回退 1080p
+- **描边样式（默认）**：白色文字 + 黑色描边 + 柔和阴影，无背景框，干净不遮挡画面。双层模式：英文行约 72% 字号、浅灰白；中文行 100% 字号、纯白。支持 `--position top/bottom` 控制整体位置（`center` 回退为 bottom 布局以保证两行不重叠）
+- **黑底样式（可选）**：`--style box` 切换为半透明黑底框（BorderStyle=3），适合高噪声画面
 - **路径转义**：自动处理 Windows 路径中的反斜杠、冒号、单引号、逗号、分号等特殊字符
 
 **编码加速：**
@@ -192,6 +192,7 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" "D:/youtube/<video_id>/video.mp4"
 | `--crf` | 23 | x264 CRF / NVENC CQ 质量参数（越小质量越高） |
 | `--preset` | medium | x264 编码预设（NVENC 下映射为 p1-p7） |
 | `--encoder` | auto | auto / libx264 / nvenc。auto 自动探测 NVENC，失败回退 libx264 |
+| `--style` | outline | outline（描边+阴影，默认）/ box（半透明黑底框） |
 
 输出文件：`video_dual.mp4`（双层）、`video_bilingual.mp4`（双语）或 `video_subtitled.mp4`（单语）
 

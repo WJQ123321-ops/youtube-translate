@@ -77,12 +77,12 @@ python "$SKILL_PATH/scripts/check_deps.py" --install
 
 ## 执行流程
 
-当用户提供 YouTube 链接时，按以下步骤执行。假设输出目录为 `./output/<video_id>`（可自定义）。
+当用户提供 YouTube 链接时，按以下步骤执行。**输出目录默认使用 `D:/youtube/<video_id>`**（本机配置，不要写到 C 盘；可按需用其他目录覆盖）。
 
 ### Step 1-3：下载 + 提取音频 + 转写（一条命令）
 
 ```bash
-python "$SKILL_PATH/scripts/download_and_transcribe.py" "<youtube_url>" ./output \
+python "$SKILL_PATH/scripts/download_and_transcribe.py" "<youtube_url>" "D:/youtube/<video_id>" \
   --model base --language en --quality best
 ```
 
@@ -105,9 +105,9 @@ python "$SKILL_PATH/scripts/download_and_transcribe.py" "<youtube_url>" ./output
   "title": "Video Title",
   "detected_language": "en",
   "files": {
-    "video": "./output/video.mp4",
-    "audio": "./output/audio.wav",
-    "srt_source": "./output/en.srt"
+    "video": "D:/youtube/<video_id>/video.mp4",
+    "audio": "D:/youtube/<video_id>/audio.wav",
+    "srt_source": "D:/youtube/<video_id>/en.srt"
   }
 }
 ```
@@ -143,7 +143,7 @@ bilingual.srt  ← 英文+中文双语
 方式 B — 先写 zh.srt，再用脚本合并双语：
 
 ```bash
-python "$SKILL_PATH/scripts/srt_utils.py" bilingual ./output/en.srt ./output/zh.srt ./output/bilingual.srt
+python "$SKILL_PATH/scripts/srt_utils.py" bilingual "D:/youtube/<video_id>/en.srt" "D:/youtube/<video_id>/zh.srt" "D:/youtube/<video_id>/bilingual.srt"
 ```
 
 ### Step 5：烧录字幕
@@ -151,20 +151,20 @@ python "$SKILL_PATH/scripts/srt_utils.py" bilingual ./output/en.srt ./output/zh.
 **推荐：双层字幕模式**（英文小字在上、中文大字在下，视觉层次分明）：
 
 ```bash
-python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 \
-  --dual ./output/en.srt ./output/zh.srt
+python "$SKILL_PATH/scripts/burn_subtitles.py" "D:/youtube/<video_id>/video.mp4" \
+  --dual "D:/youtube/<video_id>/en.srt" "D:/youtube/<video_id>/zh.srt"
 ```
 
 或使用双语 SRT（英文+中文在同一条字幕中）：
 
 ```bash
-python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/bilingual.srt --bilingual
+python "$SKILL_PATH/scripts/burn_subtitles.py" "D:/youtube/<video_id>/video.mp4" "D:/youtube/<video_id>/bilingual.srt" --bilingual
 ```
 
 仅烧录中文字幕：
 
 ```bash
-python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/zh.srt
+python "$SKILL_PATH/scripts/burn_subtitles.py" "D:/youtube/<video_id>/video.mp4" "D:/youtube/<video_id>/zh.srt"
 ```
 
 **字幕样式特性：**
@@ -200,7 +200,7 @@ python "$SKILL_PATH/scripts/burn_subtitles.py" ./output/video.mp4 ./output/zh.sr
 执行完成后，输出目录包含：
 
 ```
-output/
+D:/youtube/<video_id>/
 ├── video.mp4              # 原始下载视频
 ├── audio.wav              # 提取的音频
 ├── <lang>.srt             # 源语言字幕（英语视频即 en.srt）

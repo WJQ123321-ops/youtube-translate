@@ -123,12 +123,12 @@ def scale_params(height: int, bilingual: bool, dual: bool) -> tuple[int, int]:
     touch smaller than the old boxed defaults.
     """
     if bilingual or dual:
-        # Two lines: smaller font, a bit of bottom margin
+        # Two lines: smaller font, low bottom margin (EN stacks above ZH)
         base_font = 18
-        base_margin = 44
+        base_margin = 28
     else:
         base_font = 24
-        base_margin = 40
+        base_margin = 28
 
     scale = height / 1080.0
     font_size = max(12, int(round(base_font * scale)))
@@ -289,7 +289,8 @@ def _build_dual_filter(
     """
     en_escaped = _escape_srt_path(str(en_srt_path))
     zh_escaped = _escape_srt_path(str(zh_srt_path))
-    line_gap = int(font_size * 1.8)
+    # Tight line gap: EN sits just above the ZH line (~10px clearance at 1080p)
+    line_gap = max(6, int(font_size * 1.15))
 
     if position == 'top':
         zh_margin = margin_v
